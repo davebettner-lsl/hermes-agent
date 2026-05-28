@@ -36,9 +36,267 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-from agent.model_metadata import estimate_request_tokens_rough
+from agent.model_metadata import (
+    estimate_messages_tokens_rough,
+    estimate_request_tokens_rough,
+)
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Compression diagnostics (context-budget observability)
+# ---------------------------------------------------------------------------
+
+COMPRESSION_TRIGGERS = frozenset({
+    "agent_threshold",
+    "preflight_compression",
+    "gateway_token_hygiene",
+    "gateway_hard_message_count",
+    "manual_compression",
+    "unknown",
+})
+
+_TRIGGER_LABELS = {
+    "agent_threshold": "agent threshold (mid-turn)",
+    "preflight_compression": "preflight (before first LLM call)",
+    "gateway_token_hygiene": "gateway token hygiene",
+    "gateway_hard_message_count": "gateway hard message count",
+    "manual_compression": "manual /compress",
+    "unknown": "unknown",
+}
+
+
+def _token_chars_to_tokens(char_len: int) -> int:
+    return (char_len + 3) // 4
+
+
+def estimate_token_buckets(
+    messages: list,
+    *,
+    system_prompt: str = "",
+    tools: Optional[list] = None,
+) -> dict[str, int]:
+    """Split rough request pressure into system / messages / tools buckets."""
+    system_tokens = _token_chars_to_tokens(len(system_prompt)) if system_prompt else 0
+    message_tokens = estimate_messages_tokens_rough(messages) if messages else 0
+    tool_tokens = _token_chars_to_tokens(len(str(tools))) if tools else 0
+    return {
+        "estimated_system_prompt_tokens": system_tokens,
+        "estimated_message_tokens": message_tokens,
+        "estimated_tool_schema_tokens": tool_tokens,
+        "estimated_total_tokens": system_tokens + message_tokens + tool_tokens,
+    }
+
+
+def build_compression_diagnostics(
+    *,
+    trigger: str,
+    context_length: int,
+    threshold_tokens: int,
+    last_prompt_tokens: int = 0,
+    message_count: int = 0,
+    hard_message_limit: int = 0,
+    hygiene_threshold_pct: float = 0.0,
+    system_prompt: str = "",
+    messages: Optional[list] = None,
+    tools: Optional[list] = None,
+) -> dict[str, Any]:
+    """Structured snapshot for why compression fired or was considered."""
+    if trigger not in COMPRESSION_TRIGGERS:
+        trigger = "unknown"
+    buckets = estimate_token_buckets(
+        messages or [],
+        system_prompt=system_prompt,
+        tools=tools,
+    )
+    return {
+        "trigger": trigger,
+        "context_length": int(context_length or 0),
+        "threshold_tokens": int(threshold_tokens or 0),
+        "last_prompt_tokens": int(last_prompt_tokens or 0),
+        "message_count": int(message_count or 0),
+        "hard_message_limit": int(hard_message_limit or 0),
+        "hygiene_threshold_pct": float(hygiene_threshold_pct or 0.0),
+        **buckets,
+    }
+
+
+def store_compression_diagnostics(target: Any, diagnostics: dict[str, Any]) -> None:
+    """Persist diagnostics on a compressor, agent, or gateway session entry."""
+    if target is None or not diagnostics:
+        return
+    try:
+        setattr(target, "last_compression_diagnostics", diagnostics)
+    except Exception:
+        pass
+    comp = getattr(target, "context_compressor", None)
+    if comp is not None:
+        try:
+            comp.last_compression_diagnostics = diagnostics
+        except Exception:
+            pass
+
+
+def set_pending_compression_trigger(agent: Any, trigger: str) -> None:
+    """Set trigger on agent before ``_compress_context`` (run_agent forwarder has no trigger kwarg)."""
+    if trigger not in COMPRESSION_TRIGGERS:
+        trigger = "unknown"
+    agent._pending_compression_trigger = trigger
+
+
+def consume_pending_compression_trigger(agent: Any) -> str:
+    trigger = getattr(agent, "_pending_compression_trigger", None) or "unknown"
+    if hasattr(agent, "_pending_compression_trigger"):
+        delattr(agent, "_pending_compression_trigger")
+    if trigger not in COMPRESSION_TRIGGERS:
+        return "unknown"
+    return trigger
+
+
+def parse_hygiene_threshold_pct(comp_cfg: Any, default: float = 0.85) -> float:
+    """Read ``compression.hygiene_threshold`` from config; default matches historical 0.85."""
+    if not isinstance(comp_cfg, dict):
+        return default
+    raw = comp_cfg.get("hygiene_threshold", comp_cfg.get("hygiene_threshold_pct"))
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if val <= 0:
+        return default
+    if val > 1.0:
+        # Allow 85 meaning 85% for hand-edited configs
+        if val <= 100.0:
+            val = val / 100.0
+        else:
+            return default
+    return min(max(val, 0.01), 0.99)
+
+
+def format_compression_diagnostics_lines(
+    diagnostics: Optional[dict[str, Any]],
+    *,
+    include_buckets: bool = True,
+) -> list[str]:
+    """Concise operational lines for Discord/gateway (not a JSON wall)."""
+    if not isinstance(diagnostics, dict) or not diagnostics:
+        return []
+    trigger = diagnostics.get("trigger", "unknown")
+    label = _TRIGGER_LABELS.get(trigger, trigger)
+    lines = [f"**Last compression:** {label}"]
+    ctx_len = diagnostics.get("context_length") or 0
+    thresh = diagnostics.get("threshold_tokens") or 0
+    used = diagnostics.get("last_prompt_tokens") or 0
+    if ctx_len:
+        pct = min(100, used / ctx_len * 100) if used else 0
+        lines.append(
+            f"Context: {used:,} / {ctx_len:,} tokens"
+            + (f" ({pct:.0f}%)" if used else "")
+            + (f" — compress at {thresh:,}" if thresh else "")
+        )
+    elif thresh:
+        lines.append(f"Compress threshold: {thresh:,} tokens")
+    msg_n = diagnostics.get("message_count") or 0
+    hard_lim = diagnostics.get("hard_message_limit") or 0
+    if msg_n or hard_lim:
+        hard_note = f" (hard limit {hard_lim:,})" if hard_lim else ""
+        lines.append(f"Messages: {msg_n:,}{hard_note}")
+    hyg = diagnostics.get("hygiene_threshold_pct") or 0
+    if hyg and trigger.startswith("gateway"):
+        lines.append(f"Gateway hygiene threshold: {hyg * 100:.0f}% of context")
+    if include_buckets:
+        sys_t = diagnostics.get("estimated_system_prompt_tokens") or 0
+        msg_t = diagnostics.get("estimated_message_tokens") or 0
+        tool_t = diagnostics.get("estimated_tool_schema_tokens") or 0
+        if sys_t or msg_t or tool_t:
+            lines.append(
+                f"Budget buckets (est.): system {sys_t:,} · messages {msg_t:,} · tools {tool_t:,}"
+            )
+    return lines
+
+
+def build_context_budget_lines(
+    agent: Any = None,
+    *,
+    messages: Optional[list] = None,
+    system_prompt: str = "",
+    tools: Optional[list] = None,
+    session_entry: Any = None,
+    compression_config: Optional[dict] = None,
+    context_length: int = 0,
+    threshold_tokens: int = 0,
+    agent_threshold_pct: float = 0.0,
+) -> list[str]:
+    """Live context-budget report (preflight estimator + last compression event)."""
+    lines = ["**Context budget**"]
+    comp = getattr(agent, "context_compressor", None) if agent else None
+    ctx_len = getattr(comp, "context_length", 0) or context_length or 0
+    thresh = getattr(comp, "threshold_tokens", 0) or threshold_tokens or 0
+    agent_thresh_pct = (
+        getattr(comp, "threshold_percent", 0.0) or agent_threshold_pct or 0.0
+    )
+
+    comp_cfg = compression_config if isinstance(compression_config, dict) else {}
+    hygiene_pct = parse_hygiene_threshold_pct(comp_cfg)
+    hard_lim = 400
+    try:
+        raw_hard = comp_cfg.get("hygiene_hard_message_limit")
+        if raw_hard is not None:
+            hard_lim = max(1, int(raw_hard))
+    except (TypeError, ValueError):
+        pass
+
+    if ctx_len:
+        lines.append(f"Model window: {ctx_len:,} tokens")
+    if thresh:
+        lines.append(
+            f"Agent compress at: {thresh:,} ({agent_thresh_pct * 100:.0f}% of window)"
+            if agent_thresh_pct
+            else f"Agent compress at: {thresh:,} tokens"
+        )
+    lines.append(
+        f"Gateway hygiene at: {int(ctx_len * hygiene_pct):,} ({hygiene_pct * 100:.0f}% of window)"
+        if ctx_len
+        else f"Gateway hygiene threshold: {hygiene_pct * 100:.0f}% of window"
+    )
+    lines.append(f"Gateway hard message limit: {hard_lim:,}")
+
+    buckets = estimate_token_buckets(messages or [], system_prompt=system_prompt, tools=tools)
+    total = buckets["estimated_total_tokens"]
+    lines.append(
+        "Current load (est.): "
+        f"{total:,} total — system {buckets['estimated_system_prompt_tokens']:,} · "
+        f"messages {buckets['estimated_message_tokens']:,} · "
+        f"tools {buckets['estimated_tool_schema_tokens']:,}"
+    )
+    if messages is not None:
+        lines.append(f"Messages in scope: {len(messages):,}")
+
+    last_prompt = 0
+    if comp is not None and getattr(comp, "last_prompt_tokens", 0):
+        last_prompt = comp.last_prompt_tokens
+    elif session_entry is not None and getattr(session_entry, "last_prompt_tokens", 0):
+        last_prompt = session_entry.last_prompt_tokens
+    if last_prompt and ctx_len:
+        lines.append(f"Last API prompt_tokens: {last_prompt:,} ({min(100, last_prompt / ctx_len * 100):.0f}%)")
+
+    last_diag = None
+    if comp is not None:
+        _raw = getattr(comp, "last_compression_diagnostics", None)
+        if isinstance(_raw, dict):
+            last_diag = _raw
+    if not last_diag and session_entry is not None:
+        _raw = getattr(session_entry, "last_compression_diagnostics", None)
+        if isinstance(_raw, dict):
+            last_diag = _raw
+    if last_diag:
+        lines.append("")
+        lines.extend(format_compression_diagnostics_lines(last_diag))
+    else:
+        lines.append("Last compression: none recorded this session")
+    return lines
 
 
 def check_compression_model_feasibility(agent: Any) -> None:
@@ -293,6 +551,29 @@ def compress_context(
             check_compression_model_feasibility(agent)
         finally:
             agent._compression_feasibility_checked = True
+
+    _comp = agent.context_compressor
+    _trigger = consume_pending_compression_trigger(agent)
+    _sys_for_est = (
+        getattr(agent, "_cached_system_prompt", None)
+        or system_message
+        or ""
+    )
+    _diag = build_compression_diagnostics(
+        trigger=_trigger,
+        context_length=getattr(_comp, "context_length", 0) or 0,
+        threshold_tokens=getattr(_comp, "threshold_tokens", 0) or 0,
+        last_prompt_tokens=int(approx_tokens or 0)
+        or getattr(_comp, "last_prompt_tokens", 0)
+        or 0,
+        message_count=len(messages),
+        hard_message_limit=0,
+        system_prompt=_sys_for_est,
+        messages=messages,
+        tools=getattr(agent, "tools", None),
+    )
+    store_compression_diagnostics(_comp, _diag)
+    store_compression_diagnostics(agent, _diag)
 
     _pre_msg_count = len(messages)
     logger.info(
@@ -600,4 +881,12 @@ __all__ = [
     "replay_compression_warning",
     "compress_context",
     "try_shrink_image_parts_in_messages",
+    "build_compression_diagnostics",
+    "store_compression_diagnostics",
+    "set_pending_compression_trigger",
+    "consume_pending_compression_trigger",
+    "parse_hygiene_threshold_pct",
+    "format_compression_diagnostics_lines",
+    "build_context_budget_lines",
+    "estimate_token_buckets",
 ]

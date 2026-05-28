@@ -1054,6 +1054,49 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+def _corrupt_backup_limit() -> int:
+    raw = os.environ.get("HERMES_KANBAN_CORRUPT_BACKUP_LIMIT", "20")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 20
+    return max(1, value)
+
+
+def _corrupt_backup_files(parent: Path, base_name: str) -> list[Path]:
+    prefix = f"{base_name}.corrupt."
+    backups: list[Path] = []
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return backups
+    for child in children:
+        if (
+            child.is_file()
+            and child.name.startswith(prefix)
+            and child.name.endswith(".bak")
+            and child.parent == parent
+        ):
+            backups.append(child)
+    return sorted(backups, key=lambda p: p.stat().st_ctime, reverse=True)
+
+
+def _remove_corrupt_backup(path: Path) -> None:
+    parent = path.parent
+    for candidate in (path, parent / f"{path.name}-wal", parent / f"{path.name}-shm"):
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _prune_corrupt_backups(parent: Path, base_name: str, keep: int) -> list[Path]:
+    backups = _corrupt_backup_files(parent, base_name)
+    for stale in backups[keep:]:
+        _remove_corrupt_backup(stale)
+    return backups[:keep]
+
+
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
     """Copy a corrupt DB (and its WAL/SHM sidecars) to a timestamped backup.
 
@@ -1070,6 +1113,11 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
+    keep = _corrupt_backup_limit()
+    existing = _prune_corrupt_backups(parent, base_name, keep)
+    if len(existing) >= keep:
+        return existing[0]
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     candidate = parent / f"{base_name}.corrupt.{stamp}.bak"
     # Defensive: candidate must still be inside parent after construction.
@@ -1099,6 +1147,7 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             shutil.copy2(sidecar, sidecar_backup)
         except OSError:
             pass
+    _prune_corrupt_backups(parent, base_name, keep)
     return candidate
 
 

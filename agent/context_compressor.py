@@ -480,6 +480,7 @@ class ContextCompressor(ContextEngine):
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
+        self.last_compression_diagnostics = None
 
     def update_model(
         self,
@@ -577,6 +578,7 @@ class ContextCompressor(ContextEngine):
 
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
+        self.last_compression_diagnostics: Optional[Dict[str, Any]] = None
 
         self.summary_model = summary_model_override or ""
 

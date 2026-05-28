@@ -7611,6 +7611,9 @@ class GatewayRunner:
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
+        if canonical in ("context-budget", "context_budget"):
+            return await self._handle_context_budget_command(event)
+
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
@@ -8416,7 +8419,7 @@ class GatewayRunner:
             # real token counts.  Having hygiene at 0.50 caused premature
             # compression on every turn in long gateway sessions.
             _hyg_model = "anthropic/claude-sonnet-4.6"
-            _hyg_threshold_pct = 0.85
+            _hyg_threshold_pct = 0.85  # overridden from compression.hygiene_threshold when config loads
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 400
             _hyg_config_context_length = None
@@ -8450,6 +8453,9 @@ class GatewayRunner:
                     # compression.threshold (hygiene runs higher).
                     _comp_cfg = _hyg_data.get("compression", {})
                     if isinstance(_comp_cfg, dict):
+                        from agent.conversation_compression import parse_hygiene_threshold_pct
+
+                        _hyg_threshold_pct = parse_hygiene_threshold_pct(_comp_cfg)
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in {"true", "1", "yes"}
@@ -8550,6 +8556,11 @@ class GatewayRunner:
                     _approx_tokens >= _compress_token_threshold
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
+                _hyg_trigger = "unknown"
+                if _msg_count >= _HARD_MSG_LIMIT:
+                    _hyg_trigger = "gateway_hard_message_count"
+                elif _approx_tokens >= _compress_token_threshold:
+                    _hyg_trigger = "gateway_token_hygiene"
 
                 if _needs_compress:
                     logger.info(
@@ -8580,6 +8591,24 @@ class GatewayRunner:
                             ]
 
                             if len(_hyg_msgs) >= 4:
+                                from agent.conversation_compression import (
+                                    build_compression_diagnostics,
+                                    set_pending_compression_trigger,
+                                    store_compression_diagnostics,
+                                )
+
+                                _hyg_diag = build_compression_diagnostics(
+                                    trigger=_hyg_trigger,
+                                    context_length=_hyg_context_length,
+                                    threshold_tokens=_compress_token_threshold,
+                                    last_prompt_tokens=_approx_tokens,
+                                    message_count=_msg_count,
+                                    hard_message_limit=_HARD_MSG_LIMIT,
+                                    hygiene_threshold_pct=_hyg_threshold_pct,
+                                    messages=_hyg_msgs,
+                                )
+                                store_compression_diagnostics(session_entry, _hyg_diag)
+
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
                                     model=_hyg_model,
@@ -8591,6 +8620,9 @@ class GatewayRunner:
                                 )
                                 try:
                                     _hyg_agent._print_fn = lambda *a, **kw: None
+                                    set_pending_compression_trigger(
+                                        _hyg_agent, _hyg_trigger
+                                    )
 
                                     loop = asyncio.get_running_loop()
                                     _compressed, _ = await loop.run_in_executor(
@@ -8615,6 +8647,19 @@ class GatewayRunner:
                                     )
                                     # Reset stored token count — transcript was rewritten
                                     session_entry.last_prompt_tokens = 0
+                                    _hyg_comp = getattr(
+                                        _hyg_agent, "context_compressor", None
+                                    )
+                                    if _hyg_comp is not None:
+                                        _persist_diag = getattr(
+                                            _hyg_comp,
+                                            "last_compression_diagnostics",
+                                            None,
+                                        )
+                                        if _persist_diag:
+                                            session_entry.last_compression_diagnostics = (
+                                                _persist_diag
+                                            )
                                     history = _compressed
                                     _new_count = len(_compressed)
                                     _new_tokens = estimate_messages_tokens_rough(
@@ -12296,11 +12341,22 @@ class GatewayRunner:
                 if not compressor.has_content_to_compress(msgs):
                     return t("gateway.compress.nothing_to_do")
 
+                from agent.conversation_compression import set_pending_compression_trigger
+
+                set_pending_compression_trigger(tmp_agent, "manual_compression")
+
                 loop = asyncio.get_running_loop()
                 compressed, _ = await loop.run_in_executor(
                     None,
                     lambda: tmp_agent._compress_context(msgs, "", approx_tokens=approx_tokens, focus_topic=focus_topic, force=True)
                 )
+
+                _manual_diag = getattr(
+                    compressor, "last_compression_diagnostics", None
+                )
+                if _manual_diag:
+                    session_entry.last_compression_diagnostics = _manual_diag
+                    self.session_store._save()
 
                 # _compress_context already calls end_session() on the old session
                 # (preserving its full transcript in SQLite) and creates a new
@@ -13238,6 +13294,17 @@ class GatewayRunner:
             if ctx.compression_count:
                 lines.append(t("gateway.usage.label_compressions", count=ctx.compression_count))
 
+            from agent.conversation_compression import format_compression_diagnostics_lines
+
+            _usage_diag = getattr(ctx, "last_compression_diagnostics", None)
+            if not _usage_diag:
+                _sess = self.session_store.get_or_create_session(source)
+                _usage_diag = getattr(_sess, "last_compression_diagnostics", None)
+            _diag_lines = format_compression_diagnostics_lines(_usage_diag)
+            if _diag_lines:
+                lines.append("")
+                lines.extend(_diag_lines)
+
             if account_lines:
                 lines.append("")
                 lines.extend(account_lines)
@@ -13264,6 +13331,85 @@ class GatewayRunner:
         if account_lines:
             return "\n".join(account_lines)
         return t("gateway.usage.no_data")
+
+    async def _handle_context_budget_command(self, event: MessageEvent) -> str:
+        """Handle /context-budget — live context pressure and last compression trigger."""
+        from agent.conversation_compression import build_context_budget_lines
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id) or []
+
+        agent = self._running_agents.get(session_key)
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached = _cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+
+        msgs = [
+            m for m in history
+            if m.get("role") in {"user", "assistant", "tool"} and m.get("content")
+        ]
+        system_prompt = ""
+        tools = None
+        if agent and agent is not _AGENT_PENDING_SENTINEL:
+            system_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+            tools = getattr(agent, "tools", None)
+
+        comp_cfg: dict = {}
+        _cfg: dict = {}
+        _ctx_len = 0
+        _thresh = 0
+        _agent_pct = 0.0
+        try:
+            _cfg = _load_gateway_config() or {}
+            if isinstance(_cfg, dict):
+                _raw = _cfg.get("compression", {})
+                if isinstance(_raw, dict):
+                    comp_cfg = _raw
+                    try:
+                        _agent_pct = float(_raw.get("threshold", 0.50))
+                    except (TypeError, ValueError):
+                        _agent_pct = 0.50
+        except Exception:
+            pass
+
+        if not (agent and agent is not _AGENT_PENDING_SENTINEL):
+            try:
+                from agent.model_metadata import get_model_context_length
+
+                _model, _runtime = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=session_key,
+                    user_config=_cfg if isinstance(_cfg, dict) else None,
+                )
+                _ctx_len = get_model_context_length(
+                    _model,
+                    base_url=_runtime.get("base_url") or "",
+                    api_key=_runtime.get("api_key") or "",
+                    provider=_runtime.get("provider") or "",
+                )
+                _thresh = max(int(_ctx_len * _agent_pct), 64000)
+            except Exception:
+                pass
+
+        lines = build_context_budget_lines(
+            agent if agent and agent is not _AGENT_PENDING_SENTINEL else None,
+            messages=msgs,
+            system_prompt=system_prompt,
+            tools=tools,
+            session_entry=session_entry,
+            compression_config=comp_cfg,
+            context_length=_ctx_len,
+            threshold_tokens=_thresh,
+            agent_threshold_pct=_agent_pct,
+        )
+        return "\n".join(lines)
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""

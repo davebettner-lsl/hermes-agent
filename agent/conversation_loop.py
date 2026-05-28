@@ -523,6 +523,9 @@ def run_conversation(
                 agent.model,
                 f"{agent.context_compressor.context_length:,}",
             )
+            from agent.conversation_compression import set_pending_compression_trigger
+
+            set_pending_compression_trigger(agent, "preflight_compression")
             agent._emit_status(
                 f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
                 f">= {agent.context_compressor.threshold_tokens:,} threshold. "
@@ -3651,6 +3654,9 @@ def run_conversation(
                     )
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+                    from agent.conversation_compression import set_pending_compression_trigger
+
+                    set_pending_compression_trigger(agent, "agent_threshold")
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
