@@ -1081,6 +1081,36 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         assert MEMORY_GUIDANCE not in prompt
 
+    def test_dynamic_workflow_guidance_when_delegation_tool_loaded(self):
+        from agent.prompt_builder import DYNAMIC_WORKFLOW_GUIDANCE
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("delegate_task", "terminal"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            prompt = agent._build_system_prompt()
+
+        assert DYNAMIC_WORKFLOW_GUIDANCE in prompt
+        assert "**Fixer**" in prompt
+        assert "unadopted" in prompt
+
+    def test_no_dynamic_workflow_guidance_without_delegation_tool(self, agent):
+        from agent.prompt_builder import DYNAMIC_WORKFLOW_GUIDANCE
+
+        prompt = agent._build_system_prompt()
+        assert DYNAMIC_WORKFLOW_GUIDANCE not in prompt
+
     def test_includes_datetime(self, agent):
         prompt = agent._build_system_prompt()
         # Should contain current date info like "Conversation started:"

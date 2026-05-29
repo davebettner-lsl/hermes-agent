@@ -24,6 +24,7 @@ from agent.skill_utils import (
     parse_frontmatter,
     skill_matches_platform,
 )
+from agent.dynamic_workflows import DYNAMIC_WORKFLOW_GUIDANCE  # re-export for callers
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -351,7 +352,6 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
     "- **Keep going:** Work autonomously until the task is fully resolved. "
     "Don't stop with a plan — execute it.\n"
 )
-
 
 # Guidance injected into the system prompt when the computer_use toolset
 # is active. Universal — works for any model (Claude, GPT, open models).
